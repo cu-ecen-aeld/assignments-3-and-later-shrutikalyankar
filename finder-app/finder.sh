@@ -1,6 +1,4 @@
-#Acknowledgements: I have unfortunately lost the chatGPT chat history as I did not login on the VM. 
-#I will write acknowledgements in comments
-#!/bin/bash
+#!/bin/sh
 
 if [ $# -lt 2 ]; then   
 	echo "Error: arguments not present."
