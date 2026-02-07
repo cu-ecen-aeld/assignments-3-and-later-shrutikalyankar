@@ -1,5 +1,6 @@
 #include <stdbool.h>
 #include <pthread.h>
+#include <errno.h>
 
 /**
  * This structure should be dynamically allocated and passed as
