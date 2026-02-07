@@ -58,7 +58,7 @@ bool start_thread_obtaining_mutex(pthread_t *thread, pthread_mutex_t *mutex,int 
      if(ret != 0) {
 	free(thread_info);
 	errno = ret;
-	perror("pthread_create);
+	perror("pthread_create");
 	return false;
     }  
     return true;
