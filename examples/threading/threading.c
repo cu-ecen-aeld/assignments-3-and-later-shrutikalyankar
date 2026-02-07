@@ -18,7 +18,7 @@ void* threadfunc(void* thread_param)
     usleep(thread_func_args->wait_to_obtain_ms * 1000);
 
     /*obtaining mutex*/
-    pthread_mutex_lock (thread_func_args->mutex):
+    pthread_mutex_lock (thread_func_args->mutex);
     thread_func_args->thread_complete_success = true;
 
     /*waiting*/
@@ -51,7 +51,7 @@ bool start_thread_obtaining_mutex(pthread_t *thread, pthread_mutex_t *mutex,int 
     }
     thread_info->mutex = mutex;
     thread_info->wait_to_obtain_ms = wait_to_obtain_ms;
-    thread_info->wait_to release_ms = wait_to_release_ms;
+    thread_info->wait_to_release_ms = wait_to_release_ms;
     thread_info->thread_complete_success = false;
 
      ret = pthread_create(ref_thread, NULL, threadfunc, (void *)thread_info);
