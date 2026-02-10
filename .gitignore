@@ -8,3 +8,5 @@ aesd-build
 test.sh.log
 *test.txt*
 *actions-runner*
+.swp
+testfile.txt
