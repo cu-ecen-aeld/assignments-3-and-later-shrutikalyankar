@@ -14,18 +14,41 @@ void* threadfunc(void* thread_param)
     // TODO: wait, obtain mutex, wait, release mutex as described by thread_data structure
     // hint: use a cast like the one below to obtain thread arguments from your parameter
     struct thread_data* thread_func_args = (struct thread_data *) thread_param;
+    int ret;
     /*waiting*/
-    usleep(thread_func_args->wait_to_obtain_ms * 1000);
+    while((ret= usleep(thread_func_args->wait_to_obtain_ms * 1000)) == -1 && errno == EINTR);
+
+    if(ret == -1){
+	ERROR_LOG("usleep before lock failed");
+	thread_func_args->thread_complete_success = false;
+	return thread_param;
+     }
 
     /*obtaining mutex*/
-    pthread_mutex_lock (thread_func_args->mutex);
-    thread_func_args->thread_complete_success = true;
+    ret = pthread_mutex_lock(thread_func_args->mutex);
+    if(ret != 0){
+	ERROR_LOG("pthread_mutex_lock failed");
+	thread_func_args->thread_complete_success = false;
+	pthread_mutex_unlock(thread_func_args->mutex);
+	return thread_param;
+    }
 
-    /*waiting*/
-    usleep(thread_func_args->wait_to_release_ms * 1000);
+    while((ret = usleep(thread_func_args->wait_to_release_ms * 1000)) == -1 && errno == EINTR);
+    if(ret == -1){
+	ERROR_LOG("usleep before unlcok failed");
+	thread_func_args->thread_complete_success = false;
+	pthread_mutex_unlock(thread_func_args->mutex);
+	return thread_param;
+     }
 
     /*release mutex*/
-    pthread_mutex_unlock(thread_func_args->mutex);
+    ret = pthread_mutex_unlock(thread_func_args->mutex);
+    if(ret != 0){
+	ERROR_LOG("pthread_mutex_unlock failed");
+	return thread_param;
+    }
+
+    thread_func_args->thread_complete_success = true;
     return thread_param;
 }
 
