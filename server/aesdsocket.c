@@ -1,333 +1,271 @@
-/**
- * aesdsocket.c - AESD Socket Server
- *
- * Behavior:
- *  - Listens on TCP port 9000
- *  - Receives data until '\n' from a client, appends to /var/tmp/aesdsocketdata
- *  - Sends back the entire contents of /var/tmp/aesdsocketdata
- *  - Handles SIGINT/SIGTERM to exit gracefully and remove the data file
- *
- * Notes for Assignment 5 Part 2:
- *  - Uses select() with timeout so shutdown (SIGTERM) doesn't get stuck in accept()
- *  - Handles partial write() / send() and checks realloc()
- */
-
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <syslog.h>
 #include <unistd.h>
 
-#define PORT 9000
-#define FILE_PATH "/var/tmp/aesdsocketdata"
+#define PORT "9000"
+#define DATAFILE "/var/tmp/aesdsocketdata"
 #define BACKLOG 10
-#define BUF_SIZE 1024
 
-static int sockfd = -1;
 static volatile sig_atomic_t exit_requested = 0;
+
+/* ===================== SIGNAL HANDLING ===================== */
 
 static void signal_handler(int signo)
 {
     (void)signo;
     exit_requested = 1;
-    syslog(LOG_INFO, "Caught signal, exiting");
 }
 
-static int write_all(int fd, const void *buf, size_t len)
+static int setup_signals(void)
 {
-    const char *p = (const char *)buf;
-    size_t total = 0;
-    while (total < len)
-    {
-        ssize_t w = write(fd, p + total, len - total);
-        if (w < 0)
-        {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-        if (w == 0)
-            return -1;
-        total += (size_t)w;
-    }
-    return 0;
-}
-
-static int send_all(int fd, const void *buf, size_t len)
-{
-    const char *p = (const char *)buf;
-    size_t total = 0;
-    while (total < len)
-    {
-        ssize_t s = send(fd, p + total, len - total, 0);
-        if (s < 0)
-        {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-        if (s == 0)
-            return -1;
-        total += (size_t)s;
-    }
-    return 0;
-}
-
-int main(int argc, char *argv[])
-{
-    int daemon_mode = 0;
-
-    if (argc == 2 && strcmp(argv[1], "-d") == 0)
-        daemon_mode = 1;
-
-    openlog("aesdsocket", 0, LOG_USER);
-
-    // Signals
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = signal_handler;
-    // Do NOT set SA_RESTART so select()/accept() can be interrupted / timed out cleanly
-    sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGINT, &sa, NULL) != 0)
-    {
-        syslog(LOG_ERR, "sigaction(SIGINT) failed: %s", strerror(errno));
-        return -1;
-    }
-    if (sigaction(SIGTERM, &sa, NULL) != 0)
-    {
-        syslog(LOG_ERR, "sigaction(SIGTERM) failed: %s", strerror(errno));
-        return -1;
-    }
 
-    // Socket
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0)
-    {
-        syslog(LOG_ERR, "socket failed: %s", strerror(errno));
-        return -1;
-    }
+    if (sigaction(SIGINT, &sa, NULL) != 0) return -1;
+    if (sigaction(SIGTERM, &sa, NULL) != 0) return -1;
+    return 0;
+}
 
-    int opt = 1;
-    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) != 0)
-    {
-        syslog(LOG_ERR, "setsockopt(SO_REUSEADDR) failed: %s", strerror(errno));
-        close(sockfd);
-        return -1;
-    }
+/* ===================== SOCKET SETUP ===================== */
 
-    struct sockaddr_in servaddr;
-    memset(&servaddr, 0, sizeof(servaddr));
-    servaddr.sin_family = AF_INET;
-    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
-    servaddr.sin_port = htons(PORT);
+static int create_server_socket(void)
+{
+    struct addrinfo hints, *res, *p;
+    int sockfd = -1;
+    int status;
 
-    if (bind(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0)
-    {
-        syslog(LOG_ERR, "bind failed: %s", strerror(errno));
-        close(sockfd);
-        return -1;
-    }
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
 
-    // Daemonize after bind (so errors are visible in foreground), before listen/loop.
-    if (daemon_mode)
-    {
-        pid_t pid = fork();
-        if (pid < 0)
-        {
-            syslog(LOG_ERR, "fork failed: %s", strerror(errno));
+    status = getaddrinfo(NULL, PORT, &hints, &res);
+    if (status != 0) return -1;
+
+    for (p = res; p != NULL; p = p->ai_next) {
+        sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (sockfd < 0) continue;
+
+        int opt = 1;
+        if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) != 0) {
             close(sockfd);
-            return -1;
-        }
-        if (pid > 0)
-        {
-            // parent exits
-            exit(0);
-        }
-
-        // child continues
-        if (setsid() < 0)
-        {
-            syslog(LOG_ERR, "setsid failed: %s", strerror(errno));
-            close(sockfd);
-            return -1;
-        }
-
-        umask(0);
-
-        if (chdir("/") != 0)
-        {
-            syslog(LOG_ERR, "chdir failed: %s", strerror(errno));
-            close(sockfd);
-            return -1;
-        }
-
-        // Redirect stdio to /dev/null
-        int devnull = open("/dev/null", O_RDWR);
-        if (devnull >= 0)
-        {
-            dup2(devnull, STDIN_FILENO);
-            dup2(devnull, STDOUT_FILENO);
-            dup2(devnull, STDERR_FILENO);
-            if (devnull > 2)
-                close(devnull);
-        }
-    }
-
-    if (listen(sockfd, BACKLOG) < 0)
-    {
-        syslog(LOG_ERR, "listen failed: %s", strerror(errno));
-        close(sockfd);
-        return -1;
-    }
-
-    while (!exit_requested)
-    {
-        // Use select() so we periodically wake up and check exit_requested.
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(sockfd, &rfds);
-
-        struct timeval tv;
-        tv.tv_sec = 1;
-        tv.tv_usec = 0;
-
-        int rv = select(sockfd + 1, &rfds, NULL, NULL, &tv);
-        if (rv < 0)
-        {
-            if (errno == EINTR)
-                continue;
-            syslog(LOG_ERR, "select failed: %s", strerror(errno));
-            break;
-        }
-        if (rv == 0)
-        {
-            // timeout
+            sockfd = -1;
             continue;
         }
 
+        if (bind(sockfd, p->ai_addr, p->ai_addrlen) == 0) break;
+
+        close(sockfd);
+        sockfd = -1;
+    }
+
+    freeaddrinfo(res);
+
+    if (sockfd < 0) return -1;
+    if (listen(sockfd, BACKLOG) != 0) {
+        close(sockfd);
+        return -1;
+    }
+
+    return sockfd;
+}
+
+/* ===================== DAEMONIZE ===================== */
+
+static int daemonize(void)
+{
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid > 0) exit(EXIT_SUCCESS);
+
+    if (setsid() < 0) return -1;
+
+    pid = fork();
+    if (pid < 0) return -1;
+    if (pid > 0) exit(EXIT_SUCCESS);
+
+    umask(0);
+
+    if (chdir("/") != 0) return -1;
+
+    int fd = open("/dev/null", O_RDWR);
+    if (fd < 0) return -1;
+
+    if (dup2(fd, STDIN_FILENO) < 0) return -1;
+    if (dup2(fd, STDOUT_FILENO) < 0) return -1;
+    if (dup2(fd, STDERR_FILENO) < 0) return -1;
+
+    if (fd > 2) {
+        if (close(fd) != 0) return -1;
+    }
+
+    return 0;
+}
+
+/* ===================== FILE OPERATIONS ===================== */
+
+static int append_to_file(const char *buf, size_t len)
+{
+    int fd = open(DATAFILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return -1;
+
+    size_t written = 0;
+    while (written < len) {
+        ssize_t rc = write(fd, buf + written, len - written);
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            return -1;
+        }
+        written += (size_t)rc;
+    }
+
+    if (close(fd) != 0) return -1;
+    return 0;
+}
+
+static int send_full_file(int clientfd)
+{
+    int fd = open(DATAFILE, O_RDONLY);
+    if (fd < 0) return -1;
+
+    char buffer[4096];
+    while (1) {
+        ssize_t r = read(fd, buffer, sizeof(buffer));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            return -1;
+        }
+        if (r == 0) break;
+
+        ssize_t sent = 0;
+        while (sent < r) {
+            ssize_t s = send(clientfd, buffer + sent, (size_t)(r - sent), 0);
+            if (s < 0) {
+                if (errno == EINTR) continue;
+                close(fd);
+                return -1;
+            }
+            sent += s;
+        }
+    }
+
+    if (close(fd) != 0) return -1;
+    return 0;
+}
+
+/* ===================== MAIN ===================== */
+
+int main(int argc, char *argv[])
+{
+    bool daemon_mode = false;
+    if (argc == 2 && strcmp(argv[1], "-d") == 0) daemon_mode = true;
+
+    openlog("aesdsocket", LOG_PID, LOG_USER);
+
+    if (setup_signals() != 0) {
+        syslog(LOG_ERR, "Signal setup failed");
+        return -1;
+    }
+
+    int serverfd = create_server_socket();
+    if (serverfd < 0) {
+        syslog(LOG_ERR, "Socket setup failed");
+        return -1;
+    }
+
+    if (daemon_mode) {
+        if (daemonize() != 0) {
+            syslog(LOG_ERR, "Daemonize failed");
+            close(serverfd);
+            return -1;
+        }
+    }
+
+    while (!exit_requested) {
         struct sockaddr_in client_addr;
         socklen_t addrlen = sizeof(client_addr);
 
-        int connfd = accept(sockfd, (struct sockaddr *)&client_addr, &addrlen);
-        if (connfd < 0)
-        {
-            if (errno == EINTR)
-                continue;
-            if (exit_requested)
-                break;
-            syslog(LOG_ERR, "accept failed: %s", strerror(errno));
-            continue;
+        int clientfd = accept(serverfd, (struct sockaddr *)&client_addr, &addrlen);
+        if (clientfd < 0) {
+            if (errno == EINTR && exit_requested) break;
+            if (errno == EINTR) continue;
+            syslog(LOG_ERR, "accept failed");
+            break;
         }
 
-        char client_ip[INET_ADDRSTRLEN];
-        if (inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip)))
-            syslog(LOG_INFO, "Accepted connection from %s", client_ip);
-        else
-            syslog(LOG_INFO, "Accepted connection (inet_ntop failed)");
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
+        syslog(LOG_INFO, "Accepted connection from %s", ip);
 
         char *packet = NULL;
-        size_t total_size = 0;
-        bool saw_newline = false;
-        bool recv_error = false;
+        size_t packet_size = 0;
 
-        while (!saw_newline)
-        {
-            char buffer[BUF_SIZE];
-            ssize_t bytes = recv(connfd, buffer, sizeof(buffer), 0);
-            if (bytes < 0)
-            {
-                if (errno == EINTR)
-                    continue;
-                recv_error = true;
-                syslog(LOG_ERR, "recv failed: %s", strerror(errno));
+        while (!exit_requested) {
+            char buf[1024];
+            ssize_t r = recv(clientfd, buf, sizeof(buf), 0);
+            if (r < 0) {
+                if (errno == EINTR) continue;
                 break;
             }
-            if (bytes == 0)
-            {
-                // peer closed
-                break;
-            }
+            if (r == 0) break;
 
-            char *tmp = realloc(packet, total_size + (size_t)bytes);
-            if (!tmp)
-            {
-                syslog(LOG_ERR, "realloc failed");
-                recv_error = true;
+            char *tmp = realloc(packet, packet_size + r);
+            if (!tmp) {
+                free(packet);
+                packet = NULL;
+                packet_size = 0;
                 break;
             }
             packet = tmp;
+            memcpy(packet + packet_size, buf, r);
+            packet_size += (size_t)r;
 
-            memcpy(packet + total_size, buffer, (size_t)bytes);
-            total_size += (size_t)bytes;
+            char *newline;
+            while ((newline = memchr(packet, '\n', packet_size)) != NULL) {
+                size_t pkt_len = (newline - packet) + 1;
 
-            if (memchr(buffer, '\n', (size_t)bytes))
-                saw_newline = true;
-        }
+                if (append_to_file(packet, pkt_len) != 0) break;
+                if (send_full_file(clientfd) != 0) break;
 
-        if (!recv_error && packet && total_size > 0)
-        {
-            int fd = open(FILE_PATH, O_CREAT | O_WRONLY | O_APPEND, 0644);
-            if (fd < 0)
-            {
-                syslog(LOG_ERR, "open(%s) for append failed: %s", FILE_PATH, strerror(errno));
-            }
-            else
-            {
-                if (write_all(fd, packet, total_size) != 0)
-                    syslog(LOG_ERR, "write_all failed: %s", strerror(errno));
-                close(fd);
-            }
+                size_t remaining = packet_size - pkt_len;
+                memmove(packet, packet + pkt_len, remaining);
+                packet_size = remaining;
 
-            fd = open(FILE_PATH, O_RDONLY);
-            if (fd < 0)
-            {
-                syslog(LOG_ERR, "open(%s) for read failed: %s", FILE_PATH, strerror(errno));
-            }
-            else
-            {
-                char sendbuf[BUF_SIZE];
-                ssize_t r;
-                while ((r = read(fd, sendbuf, sizeof(sendbuf))) > 0)
-                {
-                    if (send_all(connfd, sendbuf, (size_t)r) != 0)
-                    {
-                        syslog(LOG_ERR, "send_all failed: %s", strerror(errno));
-                        break;
-                    }
-                }
-                if (r < 0)
-                    syslog(LOG_ERR, "read failed: %s", strerror(errno));
-                close(fd);
+                char *shrunk = realloc(packet, packet_size);
+                if (shrunk || packet_size == 0) packet = shrunk;
             }
         }
 
         free(packet);
 
-        if (inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip)))
-            syslog(LOG_INFO, "Closed connection from %s", client_ip);
-        else
-            syslog(LOG_INFO, "Closed connection");
+        shutdown(clientfd, SHUT_RDWR);
+        close(clientfd);
 
-        close(connfd);
+        syslog(LOG_INFO, "Closed connection from %s", ip);
     }
 
-    if (sockfd >= 0)
-        close(sockfd);
+    syslog(LOG_INFO, "Caught signal, exiting");
 
-    // Required for Part 2 reboot test: ensure no stale file remains after clean shutdown.
-    remove(FILE_PATH);
-
+    close(serverfd);
+    unlink(DATAFILE);
     closelog();
+
     return 0;
 }
