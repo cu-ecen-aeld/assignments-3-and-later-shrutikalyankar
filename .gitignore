@@ -10,3 +10,6 @@ test.sh.log
 *actions-runner*
 .swp
 testfile.txt
+aesdsocket
+server/aesdsocket
+server/valgrind-out.txt
