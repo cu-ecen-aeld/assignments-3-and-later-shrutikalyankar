@@ -5,13 +5,13 @@ TARGET ?= aesdsocket
 SRC := aesdsocket.c
 OBJ := $(SRC:.c=.o)
 
-all default: $(TARGET)
+all: $(TARGET)
 
 $(TARGET): $(OBJ)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS) -pthread
 
 %.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -pthread -c $< -o $@
 
 clean:
 	rm -f $(TARGET) $(OBJ)
