@@ -20,7 +20,14 @@
 #include <unistd.h>
 
 #define PORT "9000"
+
+#define USE_AESD_CHAR_DEVICE 1
+
+#ifdef USE_AESD_CHAR_DEVICE
+#define DATAFILE "/dev/aesdchar"
+#else
 #define DATAFILE "/var/tmp/aesdsocketdata"
+#endif
 #define BACKLOG 10
 
 static volatile sig_atomic_t exit_requested = 0;
@@ -124,7 +131,7 @@ static int daemonize(void)
 /* ================= FILE HELPERS ================= */
 static int append_to_file(const char *buf, size_t len)
 {
-    int fd = open(DATAFILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    int fd = open(DATAFILE, O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (fd < 0) return -1;
 
     size_t written = 0;
@@ -168,6 +175,9 @@ static int send_full_file(int clientfd)
 }
 
 /* ================= TIMESTAMP THREAD ================= */
+
+
+#ifndef USE_AESD_CHAR_DEVICE
 static void *timestamp_thread(void *arg)
 {
     (void)arg;
@@ -197,6 +207,7 @@ static void *timestamp_thread(void *arg)
 
     return NULL;
 }
+#endif
 
 /* ================= CLIENT THREAD ================= */
 static void *client_thread(void *arg)
@@ -239,6 +250,8 @@ static void *client_thread(void *arg)
     free(packet);
     shutdown(clientfd, SHUT_RDWR);
     close(clientfd);
+    
+    syslog(LOG_INFO, "Closed connection");
 
     node->thread_complete = true;
     return NULL;
@@ -270,8 +283,10 @@ int main(int argc, char *argv[])
 
     serverfd_global = serverfd;
 
+    #ifndef USE_AESD_CHAR_DEVICE
     pthread_t ts_thread;
     pthread_create(&ts_thread, NULL, timestamp_thread, NULL);
+    #endif
 
     while (!exit_requested) {
 
@@ -337,12 +352,16 @@ int main(int argc, char *argv[])
         free(tmp);
     }
 
+    #ifndef USE_AESD_CHAR_DEVICE
     pthread_join(ts_thread, NULL);
+    #endif
 
     if (serverfd != -1)
         close(serverfd);
 
+    #ifndef USE_AESD_CHAR_DEVICE
     unlink(DATAFILE);
+    #endif
     pthread_mutex_destroy(&file_mutex);
     closelog();
 
