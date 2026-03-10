@@ -15,3 +15,6 @@ $(TARGET): $(OBJ)
 
 clean:
 	rm -f $(TARGET) $(OBJ)
+	
+	
+
