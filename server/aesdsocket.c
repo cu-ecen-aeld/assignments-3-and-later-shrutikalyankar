@@ -1,4 +1,4 @@
-#define _GNU_SOURCE
+define _GNU_SOURCE
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -220,24 +220,30 @@ static void *client_thread(void *arg)
     struct thread_node *node = (struct thread_node *)arg;
     int clientfd = node->clientfd;
 
-    char *packet      = NULL;
+    char *packet       = malloc(1024);
     size_t packet_size = 0;
+    size_t buf_size    = 1024;
+
+    if (!packet) goto cleanup;
 
     while (!exit_requested) {
-        char buf[1024];
-        ssize_t r = recv(clientfd, buf, sizeof(buf), 0);
+        ssize_t r = recv(clientfd, packet + packet_size,
+                         buf_size - packet_size - 1, 0);
         if (r <= 0) break;
 
-        char *tmp = realloc(packet, packet_size + r);
-        if (!tmp) break;
+        packet_size += (size_t)r;
+        packet[packet_size] = '\0';
 
+        if (memchr(packet + (packet_size - (size_t)r), '\n', (size_t)r))
+            break;
+
+        buf_size += 1024;
+        char *tmp = realloc(packet, buf_size);
+        if (!tmp) goto cleanup;
         packet = tmp;
-        memcpy(packet + packet_size, buf, r);
-        packet_size += r;
+    }
 
-        char *newline;
-        while ((newline = memchr(packet, '\n', packet_size)) != NULL) {
-            size_t pkt_len = (newline - packet) + 1;
+    if (packet_size == 0) goto cleanup;
 
             pthread_mutex_lock(&file_mutex);
 
@@ -280,20 +286,20 @@ static void *client_thread(void *arg)
                  * Normal write: open for append, write packet, then
                  * open for read from beginning and send full contents.
                  */
-                int datafd = open(DATAFILE, O_WRONLY | O_CREAT | O_APPEND, 0666);
+        int datafd = open(DATAFILE, O_WRONLY | O_APPEND);
                 if (datafd >= 0) {
                     size_t written = 0;
-                    while (written < pkt_len) {
-                        ssize_t wrc = write(datafd, packet + written,
-                                            pkt_len - written);
-                        if (wrc < 0) {
-                            if (errno == EINTR) continue;
-                            break;
-                        }
-                        written += wrc;
-                    }
-                    close(datafd);
+            while (written < packet_size) {
+                ssize_t wrc = write(datafd, packet + written,
+                                    packet_size - written);
+                if (wrc < 0) {
+                    if (errno == EINTR) continue;
+                    break;
                 }
+                written += wrc;
+            }
+            close(datafd);
+        }
 
                 /* Send full file contents back */
                 int rdfd = open(DATAFILE, O_RDONLY);
@@ -308,9 +314,9 @@ static void *client_thread(void *arg)
                 int datafd = open(DATAFILE, O_WRONLY | O_CREAT | O_APPEND, 0666);
                 if (datafd >= 0) {
                     size_t written = 0;
-                    while (written < pkt_len) {
+            while (written < packet_size) {
                         ssize_t wrc = write(datafd, packet + written,
-                                            pkt_len - written);
+                                    packet_size - written);
                         if (wrc < 0) {
                             if (errno == EINTR) continue;
                             break;
@@ -330,12 +336,7 @@ static void *client_thread(void *arg)
 
             pthread_mutex_unlock(&file_mutex);
 
-            size_t remaining = packet_size - pkt_len;
-            memmove(packet, packet + pkt_len, remaining);
-            packet_size = remaining;
-        }
-    }
-
+cleanup:
     free(packet);
     shutdown(clientfd, SHUT_RDWR);
     close(clientfd);

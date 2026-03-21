@@ -63,6 +63,9 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
     struct aesd_buffer_entry *entry;
     size_t entry_offset = 0;
     size_t bytes_to_read;
+    size_t copied = 0;
+    loff_t pos = *f_pos;
+    loff_t total_size;
     ssize_t retval = 0;
 
     PDEBUG("read %zu bytes with offset %lld", count, *f_pos);
@@ -70,26 +73,43 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
     if (mutex_lock_interruptible(&dev->lock))
         return -ERESTARTSYS;
 
-    entry = aesd_circular_buffer_find_entry_offset_for_fpos(
-                &dev->buffer, (size_t)*f_pos, &entry_offset);
+    total_size = aesd_total_size(dev);
 
-    if (!entry) {
-        mutex_unlock(&dev->lock);
-        return 0;
+    if (pos >= total_size) {
+        retval = 0;
+        goto out;
     }
 
-    bytes_to_read = entry->size - entry_offset;
-    if (bytes_to_read > count)
-        bytes_to_read = count;
+    /*
+     * FIX: Loop across entries until 'count' bytes are filled or data
+     * runs out. Original code returned after the first entry, breaking
+     * reads that span multiple circular-buffer entries.
+     */
+    while (copied < count) {
+        entry = aesd_circular_buffer_find_entry_offset_for_fpos(
+                    &dev->buffer, (size_t)pos, &entry_offset);
+        if (!entry)
+            break;
 
-    if (copy_to_user(buf, entry->buffptr + entry_offset, bytes_to_read)) {
-        mutex_unlock(&dev->lock);
-        return -EFAULT;
+        bytes_to_read = entry->size - entry_offset;
+        if (bytes_to_read > (count - copied))
+            bytes_to_read = count - copied;
+
+        if (copy_to_user(buf + copied,
+                         entry->buffptr + entry_offset,
+                         bytes_to_read)) {
+            retval = -EFAULT;
+            goto out;
+        }
+
+        copied += bytes_to_read;
+        pos    += bytes_to_read;
     }
 
-    *f_pos += bytes_to_read;
-    retval  = (ssize_t)bytes_to_read;
+    *f_pos = pos;
+    retval = (ssize_t)copied;
 
+out:
     mutex_unlock(&dev->lock);
     return retval;
 }
@@ -104,6 +124,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     struct aesd_dev *dev = filp->private_data;
     char *temp;
     const char *old_entry;
+    char *newline_pos;
     ssize_t retval = -ENOMEM;
 
     PDEBUG("write %zu bytes with offset %lld", count, *f_pos);
@@ -126,21 +147,50 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
 
     dev->write_buffer_size += count;
 
-    if (memchr(dev->write_buffer, '\n', dev->write_buffer_size)) {
+    newline_pos = memchr(dev->write_buffer, '\n', dev->write_buffer_size);
+
+    while (newline_pos != NULL) {
         struct aesd_buffer_entry entry;
-        entry.buffptr = dev->write_buffer;
-        entry.size    = dev->write_buffer_size;
+        size_t cmd_len;
+        size_t remaining;
+        char *cmd_buf;
+
+        cmd_len = (size_t)(newline_pos - dev->write_buffer) + 1;
+
+        cmd_buf = kmalloc(cmd_len, GFP_KERNEL);
+        if (!cmd_buf) {
+            retval = -ENOMEM;
+            goto out;
+        }
+        memcpy(cmd_buf, dev->write_buffer, cmd_len);
+
+        entry.buffptr = cmd_buf;
+        entry.size    = cmd_len;
 
         old_entry = aesd_circular_buffer_add_entry(&dev->buffer, &entry);
         if (old_entry)
             kfree(old_entry);
 
-        dev->write_buffer      = NULL;
-        dev->write_buffer_size = 0;
+        remaining = dev->write_buffer_size - cmd_len;
+        if (remaining > 0) {
+            memmove(dev->write_buffer,
+                    dev->write_buffer + cmd_len,
+                    remaining);
+            dev->write_buffer_size = remaining;
+        } else {
+            kfree(dev->write_buffer);
+            dev->write_buffer      = NULL;
+            dev->write_buffer_size = 0;
+        }
+
+        newline_pos = (dev->write_buffer_size > 0) ?
+                      memchr(dev->write_buffer, '\n', dev->write_buffer_size) :
+                      NULL;
     }
 
     retval = (ssize_t)count;
 
+out:
     mutex_unlock(&dev->lock);
     return retval;
 }
@@ -229,9 +279,15 @@ long aesd_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         if (mutex_lock_interruptible(&dev->lock))
             return -ERESTARTSYS;
 
-        /* How many entries are currently stored */
-        count = dev->buffer.full ? AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED
-                                 : dev->buffer.in_offs;
+        if (dev->buffer.full) {
+            count = AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+        } else if (dev->buffer.in_offs >= dev->buffer.out_offs) {
+            count = dev->buffer.in_offs - dev->buffer.out_offs;
+        } else {
+            count = AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED
+                    - dev->buffer.out_offs
+                    + dev->buffer.in_offs;
+        }
 
         /* Validate write_cmd index */
         if (seekto.write_cmd >= count) {
@@ -243,8 +299,7 @@ long aesd_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         for (i = 0; i < seekto.write_cmd; i++) {
             entry_index = (uint8_t)((dev->buffer.out_offs + i) %
                            AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED);
-            entry = &dev->buffer.entry[entry_index];
-            new_pos += entry->size;
+            new_pos += dev->buffer.entry[entry_index].size;
         }
 
         /* Now point at the target entry */
