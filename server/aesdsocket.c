@@ -1,4 +1,4 @@
-define _GNU_SOURCE
+#define _GNU_SOURCE
 
 #include <arpa/inet.h>
 #include <errno.h>
