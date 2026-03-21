@@ -53,6 +53,24 @@ int aesd_release(struct inode *inode, struct file *filp)
 }
 
 /* ------------------------------------------------------------------ */
+/* helper: total bytes stored across all valid entries                  */
+/* Caller must hold dev->lock.                                         */
+/* ------------------------------------------------------------------ */
+
+static loff_t aesd_total_size(struct aesd_dev *dev)
+{
+    loff_t total = 0;
+    uint8_t index;
+    struct aesd_buffer_entry *entry;
+
+    AESD_CIRCULAR_BUFFER_FOREACH(entry, &dev->buffer, index) {
+        if (entry->buffptr)
+            total += entry->size;
+    }
+    return total;
+}
+
+/* ------------------------------------------------------------------ */
 /* read                                                                 */
 /* ------------------------------------------------------------------ */
 
@@ -149,6 +167,11 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
 
     newline_pos = memchr(dev->write_buffer, '\n', dev->write_buffer_size);
 
+    /*
+     * FIX: Loop so that multiple newline-terminated commands arriving
+     * in a single write() call are all committed to the circular buffer.
+     * Original code only handled one newline per write call.
+     */
     while (newline_pos != NULL) {
         struct aesd_buffer_entry entry;
         size_t cmd_len;
@@ -198,23 +221,6 @@ out:
 /* ------------------------------------------------------------------ */
 /* llseek                                                               */
 /* ------------------------------------------------------------------ */
-
-/**
- * Compute the total number of bytes stored across all circular buffer entries.
- * Caller must hold dev->lock.
- */
-static loff_t aesd_total_size(struct aesd_dev *dev)
-{
-    loff_t total = 0;
-    uint8_t index;
-    struct aesd_buffer_entry *entry;
-
-    AESD_CIRCULAR_BUFFER_FOREACH(entry, &dev->buffer, index) {
-        if (entry->buffptr)
-            total += entry->size;
-    }
-    return total;
-}
 
 loff_t aesd_llseek(struct file *filp, loff_t offset, int whence)
 {
@@ -279,6 +285,11 @@ long aesd_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         if (mutex_lock_interruptible(&dev->lock))
             return -ERESTARTSYS;
 
+        /*
+         * FIX: Correctly compute the number of stored entries, handling
+         * the wrap-around case where in_offs < out_offs.
+         * Original code used in_offs alone which breaks after wrap-around.
+         */
         if (dev->buffer.full) {
             count = AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
         } else if (dev->buffer.in_offs >= dev->buffer.out_offs) {
@@ -289,31 +300,29 @@ long aesd_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
                     + dev->buffer.in_offs;
         }
 
-        /* Validate write_cmd index */
         if (seekto.write_cmd >= count) {
             mutex_unlock(&dev->lock);
             return -EINVAL;
         }
 
-        /* Walk entries from out_offs to find the target command */
+        /* Sum sizes of all entries before write_cmd */
         for (i = 0; i < seekto.write_cmd; i++) {
             entry_index = (uint8_t)((dev->buffer.out_offs + i) %
                            AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED);
             new_pos += dev->buffer.entry[entry_index].size;
         }
 
-        /* Now point at the target entry */
+        /* Validate offset within the target entry */
         entry_index = (uint8_t)((dev->buffer.out_offs + seekto.write_cmd) %
                        AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED);
         entry = &dev->buffer.entry[entry_index];
 
-        /* Validate offset within the entry */
         if (seekto.write_cmd_offset >= entry->size) {
             mutex_unlock(&dev->lock);
             return -EINVAL;
         }
 
-        new_pos += seekto.write_cmd_offset;
+        new_pos    += seekto.write_cmd_offset;
         filp->f_pos = new_pos;
 
         mutex_unlock(&dev->lock);
