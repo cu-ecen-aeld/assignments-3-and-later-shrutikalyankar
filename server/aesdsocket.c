@@ -15,13 +15,29 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/ioctl.h>
 #include <syslog.h>
 #include <time.h>
 #include <unistd.h>
 
+/* aesd_ioctl.h lives next to the driver source; for the socket app build
+   we reference it via a relative path set in the Makefile, or we can
+   duplicate the necessary definitions here guarded by a guard macro. */
+#include "../aesd-char-driver/aesd_ioctl.h"
+
 #define PORT "9000"
+
+#define USE_AESD_CHAR_DEVICE 1
+
+#ifdef USE_AESD_CHAR_DEVICE
+#define DATAFILE "/dev/aesdchar"
+#else
 #define DATAFILE "/var/tmp/aesdsocketdata"
+#endif
 #define BACKLOG 10
+
+/* Prefix for ioctl seek commands received over the socket */
+#define IOCTL_SEEKTO_PREFIX "AESDCHAR_IOCSEEKTO:"
 
 static volatile sig_atomic_t exit_requested = 0;
 static int serverfd_global = -1;
@@ -45,7 +61,7 @@ static void signal_handler(int signo)
     exit_requested = 1;
 
     if (serverfd_global != -1) {
-        close(serverfd_global);   // unblock accept
+        close(serverfd_global);
         serverfd_global = -1;
     }
 }
@@ -57,9 +73,9 @@ static int create_server_socket(void)
     int sockfd = -1;
 
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
+    hints.ai_family   = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE;
+    hints.ai_flags    = AI_PASSIVE;
 
     if (getaddrinfo(NULL, PORT, &hints, &res) != 0)
         return -1;
@@ -121,10 +137,12 @@ static int daemonize(void)
     return 0;
 }
 
-/* ================= FILE HELPERS ================= */
+/* ================= TIMESTAMP THREAD ================= */
+
+#ifndef USE_AESD_CHAR_DEVICE
 static int append_to_file(const char *buf, size_t len)
 {
-    int fd = open(DATAFILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    int fd = open(DATAFILE, O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (fd < 0) return -1;
 
     size_t written = 0;
@@ -142,32 +160,6 @@ static int append_to_file(const char *buf, size_t len)
     return 0;
 }
 
-static int send_full_file(int clientfd)
-{
-    int fd = open(DATAFILE, O_RDONLY);
-    if (fd < 0) return -1;
-
-    char buffer[4096];
-    ssize_t r;
-
-    while ((r = read(fd, buffer, sizeof(buffer))) > 0) {
-        ssize_t sent = 0;
-        while (sent < r) {
-            ssize_t s = send(clientfd, buffer + sent, r - sent, 0);
-            if (s < 0) {
-                if (errno == EINTR) continue;
-                close(fd);
-                return -1;
-            }
-            sent += s;
-        }
-    }
-
-    close(fd);
-    return 0;
-}
-
-/* ================= TIMESTAMP THREAD ================= */
 static void *timestamp_thread(void *arg)
 {
     (void)arg;
@@ -187,8 +179,7 @@ static void *timestamp_thread(void *arg)
                  "%a, %d %b %Y %H:%M:%S %z", &tm_now);
 
         char line[256];
-        int len = snprintf(line, sizeof(line),
-                           "timestamp:%s\n", timestr);
+        int len = snprintf(line, sizeof(line), "timestamp:%s\n", timestr);
 
         pthread_mutex_lock(&file_mutex);
         append_to_file(line, (size_t)len);
@@ -197,6 +188,31 @@ static void *timestamp_thread(void *arg)
 
     return NULL;
 }
+#endif
+
+/* ================= SEND FROM FD ================= */
+/**
+ * Send all data from an already-open file descriptor (starting at its
+ * current position) back to the client socket.
+ */
+static int send_from_fd(int clientfd, int datafd)
+{
+    char buffer[4096];
+    ssize_t r;
+
+    while ((r = read(datafd, buffer, sizeof(buffer))) > 0) {
+        ssize_t sent = 0;
+        while (sent < r) {
+            ssize_t s = send(clientfd, buffer + sent, r - sent, 0);
+            if (s < 0) {
+                if (errno == EINTR) continue;
+                return -1;
+            }
+            sent += s;
+        }
+    }
+    return 0;
+}
 
 /* ================= CLIENT THREAD ================= */
 static void *client_thread(void *arg)
@@ -204,41 +220,128 @@ static void *client_thread(void *arg)
     struct thread_node *node = (struct thread_node *)arg;
     int clientfd = node->clientfd;
 
-    char *packet = NULL;
+    char *packet       = malloc(1024);
     size_t packet_size = 0;
+    size_t buf_size    = 1024;
+
+    if (!packet) goto cleanup;
 
     while (!exit_requested) {
-        char buf[1024];
-        ssize_t r = recv(clientfd, buf, sizeof(buf), 0);
+        ssize_t r = recv(clientfd, packet + packet_size,
+                         buf_size - packet_size - 1, 0);
         if (r <= 0) break;
 
-        char *tmp = realloc(packet, packet_size + r);
-        if (!tmp) break;
+        packet_size += (size_t)r;
+        packet[packet_size] = '\0';
 
+        if (memchr(packet + (packet_size - (size_t)r), '\n', (size_t)r))
+            break;
+
+        buf_size += 1024;
+        char *tmp = realloc(packet, buf_size);
+        if (!tmp) goto cleanup;
         packet = tmp;
-        memcpy(packet + packet_size, buf, r);
-        packet_size += r;
+    }
 
-        char *newline;
-        while ((newline = memchr(packet, '\n', packet_size)) != NULL) {
-            size_t pkt_len = (newline - packet) + 1;
+    if (packet_size == 0) goto cleanup;
 
             pthread_mutex_lock(&file_mutex);
 
-            append_to_file(packet, pkt_len);
-            send_full_file(clientfd);
+#ifdef USE_AESD_CHAR_DEVICE
+            /*
+             * Check if this packet is an AESDCHAR_IOCSEEKTO command.
+             * The packet looks like: "AESDCHAR_IOCSEEKTO:X,Y\n"
+             */
+            if (strncmp(packet, IOCTL_SEEKTO_PREFIX,
+                        strlen(IOCTL_SEEKTO_PREFIX)) == 0) {
+
+                /* Parse X and Y from "AESDCHAR_IOCSEEKTO:X,Y\n" */
+                const char *params = packet + strlen(IOCTL_SEEKTO_PREFIX);
+                struct aesd_seekto seekto;
+                seekto.write_cmd        = 0;
+                seekto.write_cmd_offset = 0;
+
+                if (sscanf(params, "%u,%u",
+                           &seekto.write_cmd,
+                           &seekto.write_cmd_offset) == 2) {
+
+                    /* Open the device, issue ioctl, read from same fd */
+                    int datafd = open(DATAFILE, O_RDWR);
+                    if (datafd >= 0) {
+                        if (ioctl(datafd, AESDCHAR_IOCSEEKTO, &seekto) == 0) {
+                            send_from_fd(clientfd, datafd);
+                        } else {
+                            syslog(LOG_ERR, "ioctl AESDCHAR_IOCSEEKTO failed: %m");
+                        }
+                        close(datafd);
+                    } else {
+                        syslog(LOG_ERR, "open %s failed: %m", DATAFILE);
+                    }
+                } else {
+                    syslog(LOG_ERR, "Failed to parse IOCSEEKTO params");
+                }
+
+            } else {
+                /*
+                 * Normal write: open for append, write packet, then
+                 * open for read from beginning and send full contents.
+                 */
+        int datafd = open(DATAFILE, O_WRONLY | O_APPEND);
+                if (datafd >= 0) {
+                    size_t written = 0;
+            while (written < packet_size) {
+                ssize_t wrc = write(datafd, packet + written,
+                                    packet_size - written);
+                if (wrc < 0) {
+                    if (errno == EINTR) continue;
+                    break;
+                }
+                written += wrc;
+            }
+            close(datafd);
+        }
+
+                /* Send full file contents back */
+                int rdfd = open(DATAFILE, O_RDONLY);
+                if (rdfd >= 0) {
+                    send_from_fd(clientfd, rdfd);
+                    close(rdfd);
+                }
+            }
+#else
+            /* Non-char-device path: append then send */
+            {
+                int datafd = open(DATAFILE, O_WRONLY | O_CREAT | O_APPEND, 0666);
+                if (datafd >= 0) {
+                    size_t written = 0;
+            while (written < packet_size) {
+                        ssize_t wrc = write(datafd, packet + written,
+                                    packet_size - written);
+                        if (wrc < 0) {
+                            if (errno == EINTR) continue;
+                            break;
+                        }
+                        written += wrc;
+                    }
+                    close(datafd);
+                }
+
+                int rdfd = open(DATAFILE, O_RDONLY);
+                if (rdfd >= 0) {
+                    send_from_fd(clientfd, rdfd);
+                    close(rdfd);
+                }
+            }
+#endif
 
             pthread_mutex_unlock(&file_mutex);
 
-            size_t remaining = packet_size - pkt_len;
-            memmove(packet, packet + pkt_len, remaining);
-            packet_size = remaining;
-        }
-    }
-
+cleanup:
     free(packet);
     shutdown(clientfd, SHUT_RDWR);
     close(clientfd);
+
+    syslog(LOG_INFO, "Closed connection");
 
     node->thread_complete = true;
     return NULL;
@@ -252,7 +355,7 @@ int main(int argc, char *argv[])
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = signal_handler;
-    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
     if (argc == 2 && strcmp(argv[1], "-d") == 0) {
@@ -270,11 +373,12 @@ int main(int argc, char *argv[])
 
     serverfd_global = serverfd;
 
+#ifndef USE_AESD_CHAR_DEVICE
     pthread_t ts_thread;
     pthread_create(&ts_thread, NULL, timestamp_thread, NULL);
+#endif
 
     while (!exit_requested) {
-
         struct sockaddr_in client_addr;
         socklen_t addrlen = sizeof(client_addr);
 
@@ -288,22 +392,18 @@ int main(int argc, char *argv[])
             break;
         }
 
-        struct thread_node *node =
-            malloc(sizeof(struct thread_node));
+        struct thread_node *node = malloc(sizeof(struct thread_node));
         if (!node) {
             close(clientfd);
             continue;
         }
 
-        node->clientfd = clientfd;
+        node->clientfd       = clientfd;
         node->thread_complete = false;
-        node->next = thread_list_head;
-        thread_list_head = node;
+        node->next           = thread_list_head;
+        thread_list_head     = node;
 
-        pthread_create(&node->thread_id,
-                       NULL,
-                       client_thread,
-                       node);
+        pthread_create(&node->thread_id, NULL, client_thread, node);
 
         /* Cleanup completed threads */
         struct thread_node *curr = thread_list_head;
@@ -337,12 +437,17 @@ int main(int argc, char *argv[])
         free(tmp);
     }
 
+#ifndef USE_AESD_CHAR_DEVICE
     pthread_join(ts_thread, NULL);
+#endif
 
     if (serverfd != -1)
         close(serverfd);
 
+#ifndef USE_AESD_CHAR_DEVICE
     unlink(DATAFILE);
+#endif
+
     pthread_mutex_destroy(&file_mutex);
     closelog();
 
